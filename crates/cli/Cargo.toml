@@ -1,0 +1,16 @@
+[package]
+name = "winter-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "winter"
+path = "src/main.rs"
+
+[dependencies]
+winter-platform.workspace = true
+
+[features]
+default = []
+dev-sample = ["winter-platform/dev-sample"]
