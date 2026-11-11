@@ -1,0 +1,11 @@
+[global]
+# MD018 off: the 120-column wrap can land an issue reference (`#N`) at line start; CommonMark does not parse it as a heading
+disable = ["MD018"]
+
+[MD004]
+style = "dash"
+
+[MD013]
+line-length = 120
+tables = false
+code-blocks = false
