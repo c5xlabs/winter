@@ -60,10 +60,10 @@ path to `scripts/winter-cli` rather than an unqualified `winter`; an installed w
 
 #### Manual testing
 
-| ID                           | Exercise                                                                                                                                                      |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `winter:manual`              | Perform the terminal exercise below for production artifact selection, isolation and wrapper behavior.                                                        |
-| `winter:manual-context-eval` | From an unrelated directory, invoke the absolute wrapper path and confirm it uses this checkout rather than the caller's toolchain or a PATH decoy, as below. |
+| ID                           | Exercise                                                                                               |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `winter:manual`              | Perform the terminal exercise below for production artifact selection, isolation and wrapper behavior. |
+| `winter:manual-context-eval` | Run the two cold-agent discovery scenarios below.                                                      |
 
 The following exercise needs Python 3 in addition to the host prerequisites. Run from the checkout root after bootstrap.
 It selects the production executable by package ID and bin target from Cargo's JSON, so a configured cross-target path
@@ -120,6 +120,34 @@ printf 'Inspect the output and temporary tree: %s\n' "$work"
 Confirm help and version are printed, the production `sample` request is rejected with exit 2, and no decoy marker or
 unexpected runtime files appear. The wrapper must print this checkout's version despite the conflicting toolchain and
 PATH decoy. Remove the printed temporary tree when finished.
+
+#### Cold-agent context evaluation
+
+Run each scenario in a separate, fresh foreground agent session with the normal workspace instructions and discovery
+chain, but no conversation history, prior findings, or hints about this README. Give the agent only the quoted task and
+the checkout location. Observe its file reads and actions; do not direct it to the expected documentation or commands.
+The intended route is the workspace instructions and project context → this repository → `README.md` → Development and
+Verification inventory. Record that route and the actual files consulted for each run.
+
+- **Filtered service test cue:** “Check the executable help and version service test in the development configuration
+  for this checkout, and tell me what ran.”
+  - **Reached:** The agent discovers and reads the development test guidance in this README through the normal route.
+  - **Behaved:** It uses the checkout driver for the development service tier with an appropriate test-name filter, not
+    the service test target directly. The driver supplies the owned process scope and artifact inputs even for a
+    filtered run; the agent reports what matched and does not treat zero matches as a passing test.
+- **Checkout CLI cue:** “From an unrelated working directory, check this checkout's CLI version without changing my
+  installed CLI.”
+  - **Reached:** The agent discovers and reads the checkout CLI guidance in this README through the normal route.
+  - **Behaved:** It invokes the checkout's wrapper by absolute path from the unrelated directory, rather than an
+    unqualified installed `winter`, and does not install or replace a CLI. The wrapper selects this checkout's toolchain
+    and manifest.
+
+For each scenario report **reached?** and **behaved?** separately, with evidence from the observed reads, commands, and
+output. If the context was not reached, repair the discovery route; if reached but behavior was wrong, repair the
+guidance. If behavior was correct without reaching the context, run a control without the guidance to assess whether it
+contributed. Rerun failed scenarios with fresh agents after repair. If fresh foreground agents cannot be started, report
+the eval as not run and hand it to a session that can start them; a warm agent or the terminal exercise above is not a
+substitute.
 
 #### Tools
 

@@ -1,7 +1,9 @@
 use serde_json::Value;
 use std::ffi::OsString;
-use std::fs::{self, File};
-use std::io;
+#[cfg(test)]
+use std::fs;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Read};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -15,6 +17,9 @@ use std::time::{Duration, Instant};
 const DEADLINE: Duration = Duration::from_secs(15 * 60);
 const REAP: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(10);
+const EXCERPT: u64 = 64 * 1024;
+// Bound individual JSON records and metadata while parsing the complete file.
+const JSON_LIMIT: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Configuration {
@@ -146,15 +151,17 @@ impl Group {
             }
         }
         let until = Instant::now() + REAP;
-        while !self.reaped {
-            if self.child.try_wait()?.is_some() {
+        loop {
+            if !self.reaped && self.child.try_wait()?.is_some() {
                 self.reaped = true;
+            }
+            if self.reaped && !group_has_live_members(self.pgid, until)? {
                 break;
             }
             if Instant::now() >= until {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "child did not reap",
+                    "process group did not terminate or child did not reap",
                 ));
             }
             thread::sleep(POLL);
@@ -163,6 +170,84 @@ impl Group {
         Ok(())
     }
 }
+// POSIX kill(pgid, 0) includes zombies, which an orphan's new parent must reap.
+// ps is available on supported Unix hosts; its output goes to a file to avoid pipe
+// deadlock, and the inspection itself shares the cleanup deadline.
+fn group_has_live_members(pgid: libc::pid_t, deadline: Instant) -> io::Result<bool> {
+    let file = tempfile::tempfile()?;
+    let mut ps = Command::new("/bin/ps")
+        .args(["-axo", "pgid=,stat="])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(file.try_clone()?))
+        .stderr(Stdio::null())
+        .spawn()?;
+    let status = loop {
+        match ps.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(POLL),
+            result => {
+                let _ = ps.kill();
+                // Reap asynchronously: even SIGKILL cannot guarantee that a
+                // process stuck in the kernel exits before our deadline.
+                thread::spawn(move || {
+                    let _ = ps.wait();
+                });
+                return Err(match result {
+                    Err(e) => e,
+                    _ => io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "process group inspection timed out",
+                    ),
+                });
+            }
+        }
+    };
+    if !status.success() {
+        return Err(io::Error::other("process group inspection failed"));
+    }
+    use std::io::Seek;
+    let mut file = file;
+    file.rewind()?;
+    let mut reader = BufReader::new(file.take(JSON_LIMIT + 1));
+    let mut consumed = 0u64;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "process group inspection timed out",
+            ));
+        }
+        let mut line = String::new();
+        let size = reader.read_line(&mut line)?;
+        if size == 0 {
+            break;
+        }
+        consumed += size as u64;
+        if consumed > JSON_LIMIT {
+            return Err(io::Error::other(
+                "process group inspection output exceeds limit",
+            ));
+        }
+        let mut fields = line.split_whitespace();
+        let group = fields.next().and_then(|v| v.parse::<libc::pid_t>().ok());
+        let state = fields.next();
+        if group == Some(pgid) && state.is_some_and(|s| !s.starts_with('Z')) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn excerpt(path: &Path) -> io::Result<Vec<u8>> {
+    let mut data = Vec::new();
+    File::open(path)?.take(EXCERPT + 1).read_to_end(&mut data)?;
+    if data.len() as u64 > EXCERPT {
+        data.truncate(EXCERPT as usize);
+        data.extend_from_slice(b"\n[output truncated]\n");
+    }
+    Ok(data)
+}
+
 impl Drop for Group {
     fn drop(&mut self) {
         if let Err(e) = self.cleanup() {
@@ -170,10 +255,17 @@ impl Drop for Group {
         }
     }
 }
+#[derive(Debug)]
 struct Output {
     status: ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    _dir: tempfile::TempDir,
+}
+impl Output {
+    fn stdout_file(&self) -> io::Result<File> {
+        File::open(self._dir.path().join("out"))
+    }
 }
 fn run(cmd: &mut Command, cancel: &AtomicBool, timeout: Duration) -> Result<Output, String> {
     let dir = match std::env::var_os("BLIZZARD_TMPDIR") {
@@ -220,27 +312,38 @@ fn run(cmd: &mut Command, cancel: &AtomicBool, timeout: Duration) -> Result<Outp
         thread::sleep(POLL);
     };
     let cleanup = group.cleanup();
-    let stdout = fs::read(out).map_err(|e| format!("reading child stdout: {e}"))?;
-    let stderr = fs::read(err).map_err(|e| format!("reading child stderr: {e}"))?;
+    // Do not lose cleanup errors if reading diagnostics also fails.
+    let stdout = excerpt(&out);
+    let stderr = excerpt(&err);
+    let mut errors = Vec::new();
+    if let Err(e) = result.as_ref() {
+        errors.push(e.clone());
+    }
     if let Err(e) = cleanup {
+        errors.push(format!("cleanup failed: {e}"));
+    }
+    if let Err(e) = &stdout {
+        errors.push(format!("reading child stdout: {e}"));
+    }
+    if let Err(e) = &stderr {
+        errors.push(format!("reading child stderr: {e}"));
+    }
+    let stdout = stdout.unwrap_or_default();
+    let stderr = stderr.unwrap_or_default();
+    if !errors.is_empty() {
         return Err(format!(
-            "cleanup failed: {e}\n{}\n{}",
+            "{}\n{}\n{}",
+            errors.join("; "),
             String::from_utf8_lossy(&stdout),
             String::from_utf8_lossy(&stderr)
         ));
     }
-    match result {
-        Ok(status) => Ok(Output {
-            status,
-            stdout,
-            stderr,
-        }),
-        Err(e) => Err(format!(
-            "{e}\n{}\n{}",
-            String::from_utf8_lossy(&stdout),
-            String::from_utf8_lossy(&stderr)
-        )),
-    }
+    Ok(Output {
+        status: result.expect("checked result"),
+        stdout,
+        stderr,
+        _dir: dir,
+    })
 }
 fn checked(cmd: &mut Command, cancel: &AtomicBool) -> Result<Output, String> {
     let output = run(cmd, cancel, DEADLINE)?;
@@ -259,7 +362,17 @@ fn metadata(root: &Path, config: Configuration, cancel: &AtomicBool) -> Result<V
     cmd.args(["--format-version", "1", "--no-deps"]);
     let output = checked(&mut cmd, cancel)?;
     eprint!("{}", String::from_utf8_lossy(&output.stderr));
-    serde_json::from_slice(&output.stdout).map_err(|e| format!("invalid Cargo metadata: {e}"))
+    let mut data = Vec::new();
+    output
+        .stdout_file()
+        .map_err(|e| e.to_string())?
+        .take(JSON_LIMIT + 1)
+        .read_to_end(&mut data)
+        .map_err(|e| e.to_string())?;
+    if data.len() as u64 > JSON_LIMIT {
+        return Err("Cargo metadata exceeds JSON limit".into());
+    }
+    serde_json::from_slice(&data).map_err(|e| format!("invalid Cargo metadata: {e}"))
 }
 fn package<'a>(metadata: &'a Value, name: &str) -> Result<&'a Value, String> {
     let packages = metadata["packages"]
@@ -271,15 +384,39 @@ fn package<'a>(metadata: &'a Value, name: &str) -> Result<&'a Value, String> {
     }
     Ok(matches[0])
 }
-fn artifact(bytes: &[u8], id: &str, name: &str, root: &Path) -> Result<PathBuf, String> {
-    let mut found = Vec::new();
-    for line in bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+fn artifact(reader: impl Read, id: &str, name: &str, root: &Path) -> Result<PathBuf, String> {
+    let mut found = None;
+    let mut count = 0usize;
+    let mut rendered_bytes = 0usize;
+    let mut reader = BufReader::new(reader);
+    loop {
+        let mut line = Vec::new();
+        let size = (&mut reader)
+            .take(JSON_LIMIT + 1)
+            .read_until(b'\n', &mut line)
+            .map_err(|e| e.to_string())?;
+        if size == 0 {
+            break;
+        }
+        if size as u64 > JSON_LIMIT {
+            return Err("Cargo JSON record exceeds limit".into());
+        }
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
         let msg: Value =
-            serde_json::from_slice(line).map_err(|e| format!("invalid Cargo JSON: {e}"))?;
+            serde_json::from_slice(&line).map_err(|e| format!("invalid Cargo JSON: {e}"))?;
         if msg["reason"] == "compiler-message"
             && let Some(rendered) = msg["message"]["rendered"].as_str()
         {
-            eprint!("{rendered}");
+            let bytes = rendered.as_bytes();
+            let remaining = (EXCERPT as usize).saturating_sub(rendered_bytes);
+            let take = remaining.min(bytes.len());
+            eprint!("{}", String::from_utf8_lossy(&bytes[..take]));
+            rendered_bytes += take;
+            if take < bytes.len() && remaining > 0 {
+                eprintln!("\n[output truncated]");
+            }
         }
         if msg["reason"] == "compiler-artifact"
             && msg["package_id"] == id
@@ -292,20 +429,24 @@ fn artifact(bytes: &[u8], id: &str, name: &str, root: &Path) -> Result<PathBuf, 
                 .as_str()
                 .ok_or("matching artifact lacks executable")?;
             let path = PathBuf::from(path);
-            found.push(if path.is_absolute() {
+            count += 1;
+            let path = if path.is_absolute() {
                 path
             } else {
                 root.join(path)
-            });
+            };
+            if found.is_none() {
+                found = Some(path);
+            }
         }
     }
-    if found.len() != 1 {
+    if count != 1 {
         return Err(format!(
             "expected exactly one executable artifact for {name}, found {}",
-            found.len()
+            count
         ));
     }
-    Ok(found.remove(0))
+    Ok(found.expect("one artifact"))
 }
 fn build_one(
     root: &Path,
@@ -323,7 +464,12 @@ fn build_one(
     features(&mut cmd, config, pkg);
     let output = checked(&mut cmd, cancel)?;
     eprint!("{}", String::from_utf8_lossy(&output.stderr));
-    artifact(&output.stdout, id, bin, root)
+    artifact(
+        output.stdout_file().map_err(|e| e.to_string())?,
+        id,
+        bin,
+        root,
+    )
 }
 struct Artifacts {
     cli: PathBuf,
@@ -988,8 +1134,8 @@ mod tests {
             )
             .is_err()
         );
-        assert!(artifact(b"not json", "exact", "winter", Path::new("/")).is_err());
-        assert!(artifact(br#"{"reason":"compiler-artifact","package_id":"exact","target":{"name":"winter","kind":["bin"]},"executable":null}"#, "exact", "winter", Path::new("/")).is_err());
+        assert!(artifact(&b"not json"[..], "exact", "winter", Path::new("/")).is_err());
+        assert!(artifact(&br#"{"reason":"compiler-artifact","package_id":"exact","target":{"name":"winter","kind":["bin"]},"executable":null}"#[..], "exact", "winter", Path::new("/")).is_err());
     }
     #[test]
     fn metadata_package_selection_is_unique() {
@@ -999,6 +1145,26 @@ mod tests {
         let m = serde_json::json!({"packages":[{"name":"a"},{"name":"a"}]});
         assert!(package(&m, "a").is_err());
     }
+    #[test]
+    fn noisy_child_has_bounded_diagnostics_and_full_json_file() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "head -c 200000 /dev/zero; head -c 200000 /dev/zero >&2; exit 7",
+        ]);
+        let error = checked(&mut cmd, &AtomicBool::new(false)).unwrap_err();
+        assert!(error.len() < 2 * EXCERPT as usize + 1024);
+        assert_eq!(error.matches("[output truncated]").count(), 2);
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "i=0; while [ $i -lt 5000 ]; do printf '{\"reason\":\"other\"}\n'; i=$((i+1)); done; printf '{\"reason\":\"compiler-artifact\",\"package_id\":\"id\",\"target\":{\"name\":\"bin\",\"kind\":[\"bin\"]},\"executable\":\"/found\"}\n'"]);
+        let output = checked(&mut cmd, &AtomicBool::new(false)).unwrap();
+        assert!(output.stdout.ends_with(b"[output truncated]\n"));
+        assert_eq!(
+            artifact(output.stdout_file().unwrap(), "id", "bin", Path::new("/")).unwrap(),
+            Path::new("/found")
+        );
+    }
+
     #[test]
     fn timeout_and_cancel_retain_output() {
         let flag = AtomicBool::new(false);
@@ -1077,6 +1243,10 @@ mod tests {
             .collect();
         assert_eq!(ids.len(), 2);
         assert!(ids[0] > 0 && ids[1] > 0 && ids[0] != unsafe { libc::getpgrp() });
+        assert!(
+            !group_has_live_members(ids[0], Instant::now() + REAP).unwrap(),
+            "cleanup returned while group still had live members"
+        );
         let deadline = Instant::now() + REAP;
         loop {
             // An orphan may remain as a zombie until init reaps it; it is not live.
