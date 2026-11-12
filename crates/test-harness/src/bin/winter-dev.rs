@@ -276,10 +276,10 @@ fn artifact(bytes: &[u8], id: &str, name: &str, root: &Path) -> Result<PathBuf, 
     for line in bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
         let msg: Value =
             serde_json::from_slice(line).map_err(|e| format!("invalid Cargo JSON: {e}"))?;
-        if msg["reason"] == "compiler-message" {
-            if let Some(rendered) = msg["message"]["rendered"].as_str() {
-                eprint!("{rendered}");
-            }
+        if msg["reason"] == "compiler-message"
+            && let Some(rendered) = msg["message"]["rendered"].as_str()
+        {
+            eprint!("{rendered}");
         }
         if msg["reason"] == "compiler-artifact"
             && msg["package_id"] == id
@@ -416,7 +416,7 @@ fn test(
             }
             cmd.env("WINTER_TEST_CLI_PATH", &a.cli)
                 .env("WINTER_TEST_EXPECTED_VERSION", &a.version)
-                .env("WINTER_TEST_PROCESS_SCOPE", "driver-owned");
+                .env("WINTER_TEST_PROCESS_SCOPE", std::process::id().to_string());
             if let Some(sample) = &a.sample {
                 cmd.env("WINTER_TEST_SAMPLE_PATH", sample);
             } else {
