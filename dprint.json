@@ -6,6 +6,9 @@
     "strongKind": "asterisks",
     "unorderedListKind": "dashes"
   },
+  "shfmt": {
+    "associations": ["**/*.sh", "scripts/winter-cli"]
+  },
   "excludes": ["target/**", ".tools/**"],
   "plugins": [
     "https://plugins.dprint.dev/markdown-0.29.0.wasm",

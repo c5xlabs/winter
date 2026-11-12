@@ -330,6 +330,22 @@ struct Artifacts {
     sample: Option<PathBuf>,
     version: String,
 }
+fn exec_cli(artifacts: Artifacts, args: Vec<OsString>) -> Result<(), String> {
+    if !artifacts.cli.is_absolute() {
+        return Err("CLI artifact path is not absolute".into());
+    }
+    let sample = artifacts.sample.ok_or("missing sample")?;
+    if !sample.is_absolute() {
+        return Err("sample artifact path is not absolute".into());
+    }
+    let mut cmd = Command::new(&artifacts.cli);
+    cmd.args(args).env("WINTER_DEV_SAMPLE_PATH", sample);
+    Err(format!(
+        "exec {} failed: {}",
+        artifacts.cli.display(),
+        cmd.exec()
+    ))
+}
 fn build(root: &Path, config: Configuration, cancel: &AtomicBool) -> Result<Artifacts, String> {
     let meta = metadata(root, config, cancel)?;
     let version = package(&meta, "winter-cli")?["version"]
@@ -467,10 +483,7 @@ fn main() {
             if cancel.load(Ordering::Relaxed) {
                 return Err("cancelled".into());
             }
-            let mut cmd = Command::new(a.cli);
-            cmd.args(args)
-                .env("WINTER_DEV_SAMPLE_PATH", a.sample.ok_or("missing sample")?);
-            Err(format!("exec failed: {}", cmd.exec()))
+            exec_cli(a, args)
         }),
     };
     if let Err(e) = result {
@@ -482,7 +495,426 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::AtomicBool;
+    use winter_test_harness::{Completion, RuntimeFixture, Termination, TestSignal, invoke};
+
+    fn executable(path: &Path, contents: &str) {
+        fs::write(path, contents).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    // This test-only subprocess entry exercises the actual exec seam, not a public driver option.
+    #[test]
+    fn exec_helper() {
+        let Some(target) = std::env::var_os("WINTER_EXEC_TEST_TARGET") else {
+            return;
+        };
+        let result = exec_cli(
+            Artifacts {
+                cli: target.into(),
+                sample: Some("/selected sample".into()),
+                version: String::new(),
+            },
+            vec![
+                OsString::new(),
+                "a b".into(),
+                "--option".into(),
+                OsString::from_vec(b"bad-\xff".to_vec()),
+            ],
+        );
+        eprintln!("winter-dev: {}", result.unwrap_err());
+        std::process::exit(1);
+    }
+
+    #[test]
+    fn exec_handoff_preserves_process_context_and_failure() {
+        let fixture = RuntimeFixture::new().unwrap();
+        let target = fixture.path().join("target");
+        executable(
+            &target,
+            "#!/bin/sh\nprintf '%s\\0' \"$$\" \"$PWD\" \"$WINTER_DEV_SAMPLE_PATH\" \"$PROBE\" \"$@\"\n/bin/cat\nprintf diagnostic >&2\nexit 37\n",
+        );
+        let mut call = fixture.invocation(std::env::current_exe().unwrap());
+        call.args = args(&["--exact", "tests::exec_helper", "--nocapture"]);
+        call.env.insert(
+            "WINTER_EXEC_TEST_TARGET".into(),
+            target.clone().into_os_string(),
+        );
+        call.env.insert("PROBE".into(), "preserved".into());
+        call.stdin = b"stdin-\xff".to_vec();
+        let result = invoke(call).unwrap();
+        let expected = format!(
+            "{}\0{}\0/selected sample\0preserved\0\0a b\0--option\0",
+            result.spawned_pid,
+            fixture.path().join("cwd").display()
+        );
+        assert!(
+            result
+                .stdout
+                .windows(expected.len())
+                .any(|s| s == expected.as_bytes())
+        );
+        assert!(result.stdout.ends_with(b"bad-\xff\0stdin-\xff"));
+        assert_eq!(result.stderr, b"diagnostic");
+        assert_eq!(result.termination, Termination::Code(37));
+
+        for (signal, number) in [
+            (TestSignal::Interrupt, libc::SIGINT),
+            (TestSignal::Terminate, libc::SIGTERM),
+        ] {
+            executable(&target, "#!/bin/sh\nprintf ready\nexec /bin/sleep 10\n");
+            let mut call = fixture.invocation(std::env::current_exe().unwrap());
+            call.args = args(&["--exact", "tests::exec_helper", "--nocapture"]);
+            call.env.insert(
+                "WINTER_EXEC_TEST_TARGET".into(),
+                target.clone().into_os_string(),
+            );
+            call.completion = Completion::SignalAfterStdout {
+                marker: b"ready".to_vec(),
+                signal,
+            };
+            assert_eq!(
+                invoke(call).unwrap().termination,
+                Termination::Signal(number)
+            );
+        }
+        let mut call = fixture.invocation(std::env::current_exe().unwrap());
+        call.args = args(&["--exact", "tests::exec_helper", "--nocapture"]);
+        call.env.insert(
+            "WINTER_EXEC_TEST_TARGET".into(),
+            fixture.path().join("missing").into_os_string(),
+        );
+        let failure = invoke(call).unwrap();
+        assert_eq!(failure.termination, Termination::Code(1));
+        assert!(String::from_utf8_lossy(&failure.stderr).contains("winter-dev: exec "));
+    }
+
+    #[test]
+    fn wrapper_passes_raw_arguments_and_context_to_cargo() {
+        let fixture = RuntimeFixture::new().unwrap();
+        let cargo = fixture.path().join("bin/cargo");
+        executable(
+            &cargo,
+            "#!/bin/bash\nprintf '%s\\0' \"$$\" \"$PWD\" \"$@\"\n/bin/cat\nprintf cargo-stderr >&2\nexit 23\n",
+        );
+        let mut call = fixture.invocation(root().join("scripts/winter-cli"));
+        call.args = vec![
+            OsString::new(),
+            "a b".into(),
+            "--option".into(),
+            OsString::from_vec(b"bad-\xff".to_vec()),
+        ];
+        call.stdin = b"input-\xff".to_vec();
+        // The wrapper needs Bash's dirname in addition to the controlled Cargo.
+        call.env.insert(
+            "PATH".into(),
+            format!("{}:/usr/bin:/bin", fixture.path().join("bin").display()).into(),
+        );
+        let result = invoke(call).unwrap();
+        let mut expected = Vec::new();
+        let manifest = root().join("Cargo.toml");
+        let channel = fs::read_to_string(root().join("rust-toolchain.toml")).unwrap();
+        let channel = channel
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("channel = \"")
+                    .and_then(|s| s.strip_suffix('"'))
+            })
+            .unwrap();
+        let pid = result.spawned_pid.to_string();
+        let version = format!("+{channel}");
+        for arg in [
+            pid.as_bytes(),
+            fixture.path().join("cwd").as_os_str().as_bytes(),
+            version.as_bytes(),
+            b"run",
+            b"--locked",
+            b"--offline",
+            b"--manifest-path",
+            manifest.as_os_str().as_bytes(),
+            b"-p",
+            b"winter-test-harness",
+            b"--bin",
+            b"winter-dev",
+            b"--",
+            b"run",
+            b"--",
+            b"",
+            b"a b",
+            b"--option",
+            b"bad-\xff",
+        ] {
+            expected.extend_from_slice(arg);
+            expected.push(0);
+        }
+        expected.extend_from_slice(b"input-\xff");
+        assert_eq!(result.stdout, expected);
+        assert_eq!(result.stderr, b"cargo-stderr");
+        assert_eq!(result.termination, Termination::Code(23));
+    }
+
+    // The nested driver creates its own Cargo process groups. Keep the wrapper as a
+    // direct child, let its SIGTERM handler clean those groups, and retain an
+    // independent emergency path even on assertion failure or panic.
+    struct NestedGuard {
+        child: Child,
+        pid: libc::pid_t,
+        reaped: bool,
+    }
+    impl NestedGuard {
+        fn start(cmd: &mut Command) -> Self {
+            let child = cmd.process_group(0).spawn().unwrap();
+            let pid = libc::pid_t::try_from(child.id()).unwrap();
+            assert!(pid > 0 && pid != unsafe { libc::getpgrp() });
+            Self {
+                child,
+                pid,
+                reaped: false,
+            }
+        }
+        fn wait_until(&mut self, deadline: Instant) -> Option<ExitStatus> {
+            while Instant::now() < deadline {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    self.reaped = true;
+                    return Some(status);
+                }
+                thread::sleep(POLL);
+            }
+            None
+        }
+        fn cancel(&mut self) -> Option<ExitStatus> {
+            if unsafe { libc::kill(self.pid, libc::SIGTERM) } != 0 {
+                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+            }
+            self.wait_until(Instant::now() + Duration::from_secs(3))
+        }
+        fn emergency(&mut self) -> Vec<libc::pid_t> {
+            let mut killed = Vec::new();
+            if self.reaped {
+                return killed;
+            }
+            // Freeze the direct child before enumerating its direct children, so
+            // it cannot spawn/reap and recycle a recorded process-group leader.
+            if unsafe { libc::kill(self.pid, libc::SIGSTOP) } == 0 {
+                let until = Instant::now() + Duration::from_secs(2);
+                let mut status = 0;
+                let mut stopped = false;
+                while Instant::now() < until {
+                    let result = unsafe {
+                        libc::waitpid(self.pid, &mut status, libc::WUNTRACED | libc::WNOHANG)
+                    };
+                    if result == self.pid {
+                        if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+                            self.reaped = true;
+                            return killed;
+                        }
+                        if libc::WIFSTOPPED(status) {
+                            stopped = true;
+                            break;
+                        }
+                    }
+                    thread::sleep(POLL);
+                }
+                let mut ps = Command::new("ps");
+                ps.args(["-axo", "pid=,ppid=,pgid="]);
+                let output = if stopped {
+                    run(&mut ps, &AtomicBool::new(false), Duration::from_secs(2))
+                        .ok()
+                        .filter(|output| output.status.success())
+                        .map(|output| output.stdout)
+                } else {
+                    None
+                };
+                if output.is_none() {
+                    eprintln!("could not enumerate frozen nested driver groups");
+                }
+                for line in String::from_utf8_lossy(output.as_deref().unwrap_or_default()).lines() {
+                    let fields: Vec<libc::pid_t> = line
+                        .split_whitespace()
+                        .filter_map(|s| s.parse().ok())
+                        .collect();
+                    if let [pid, parent, pgid] = fields.as_slice()
+                        && *parent == self.pid
+                        && *pid == *pgid
+                        && *pid > 0
+                        && *pid != unsafe { libc::getpgrp() }
+                    {
+                        unsafe {
+                            libc::kill(-*pid, libc::SIGKILL);
+                        }
+                        killed.push(*pid);
+                    }
+                }
+            }
+            unsafe {
+                libc::kill(-self.pid, libc::SIGKILL);
+            }
+            if self
+                .wait_until(Instant::now() + Duration::from_secs(3))
+                .is_none()
+            {
+                eprintln!("nested wrapper did not reap after emergency cleanup");
+            }
+            killed
+        }
+    }
+    impl Drop for NestedGuard {
+        fn drop(&mut self) {
+            if !self.reaped && self.cancel().is_none() {
+                let _ = self.emergency();
+            }
+        }
+    }
+
+    fn nested_command(
+        fixture: &RuntimeFixture,
+        name: &str,
+        program: &Path,
+    ) -> (Command, PathBuf, PathBuf) {
+        let out = fixture.path().join(format!("{name}-out"));
+        let err = fixture.path().join(format!("{name}-err"));
+        let mut cmd = Command::new(program);
+        let mut path = fixture.path().join("bin").into_os_string();
+        path.push(":");
+        path.push(std::env::var_os("PATH").unwrap_or_default());
+        cmd.current_dir(fixture.path().join("cwd"))
+            .env("PATH", path)
+            .stdin(Stdio::null())
+            .stdout(File::create(&out).unwrap())
+            .stderr(File::create(&err).unwrap());
+        (cmd, out, err)
+    }
+
+    #[test]
+    fn nested_timeout_cancels_driver_and_live_cargo_group() {
+        exercise_nested_cleanup(false);
+    }
+
+    #[test]
+    fn nested_emergency_guard_kills_exact_live_cargo_group() {
+        exercise_nested_cleanup(true);
+    }
+
+    fn exercise_nested_cleanup(emergency: bool) {
+        let fixture = RuntimeFixture::new().unwrap();
+        let proxy = fixture.path().join("cargo-proxy");
+        let ready = fixture.path().join("ready");
+        let escaped = fixture.path().join("escaped");
+        executable(
+            &proxy,
+            "#!/bin/sh\n(/bin/sleep 1; printf escaped > \"$ESCAPED\") &\nprintf '%s %s' \"$$\" \"$!\" > \"$READY\"\nwait\n",
+        );
+        let cancel = AtomicBool::new(false);
+        let meta = metadata(&root(), Configuration::Development, &cancel).unwrap();
+        let driver = build_one(
+            &root(),
+            Configuration::Development,
+            &meta,
+            "winter-test-harness",
+            "winter-dev",
+            &cancel,
+        )
+        .unwrap();
+        let (mut cmd, _, err) = nested_command(&fixture, "timeout", &driver);
+        cmd.env("CARGO", proxy)
+            .env("READY", &ready)
+            .env("ESCAPED", &escaped)
+            .args(["run", "--", "--version"]);
+        let mut guard = NestedGuard::start(&mut cmd);
+        let until = Instant::now() + Duration::from_secs(60);
+        while !ready.exists() && Instant::now() < until {
+            assert!(
+                guard.child.try_wait().unwrap().is_none(),
+                "driver exited before readiness: {}",
+                String::from_utf8_lossy(&fs::read(&err).unwrap())
+            );
+            thread::sleep(POLL);
+        }
+        let ids = fs::read_to_string(&ready).expect("nested cargo readiness");
+        let ids: Vec<i32> = ids.split_whitespace().map(|s| s.parse().unwrap()).collect();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(unsafe { libc::getpgid(ids[0]) }, ids[0]);
+        assert_eq!(unsafe { libc::getpgid(ids[1]) }, ids[0]);
+        assert_ne!(ids[0], unsafe { libc::getpgrp() });
+        if emergency {
+            assert_eq!(
+                guard.emergency(),
+                vec![ids[0]],
+                "must target only the owned nested group"
+            );
+            assert!(guard.reaped, "emergency cleanup must reap the driver");
+        } else {
+            // An expired test deadline follows this same cooperative cancellation path.
+            assert!(guard.wait_until(Instant::now()).is_none());
+            let status = guard
+                .cancel()
+                .expect("nested driver did not clean up before deadline");
+            assert!(!status.success());
+            assert!(String::from_utf8_lossy(&fs::read(err).unwrap()).contains("cancelled"));
+        }
+        thread::sleep(Duration::from_millis(1200));
+        assert!(
+            !escaped.exists(),
+            "live nested descendant survived cancellation"
+        );
+    }
+
+    #[test]
+    fn real_wrapper_uses_checkout_from_unrelated_directory() {
+        let fixture = RuntimeFixture::new().unwrap();
+        fs::write(
+            fixture.path().join("cwd/rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"nonexistent-conflicting-toolchain\"\n",
+        )
+        .unwrap();
+        let marker = fixture.path().join("decoy-ran");
+        executable(
+            &fixture.path().join("bin/winter"),
+            &format!("#!/bin/sh\nprintf bad > '{}'\nexit 99\n", marker.display()),
+        );
+        let meta = metadata(&root(), Configuration::Development, &AtomicBool::new(false)).unwrap();
+        let version = package(&meta, "winter-cli").unwrap()["version"]
+            .as_str()
+            .unwrap();
+        for (arguments, status, stream, expected) in [
+            (vec!["--version"], 0, true, format!("winter {version}")),
+            (vec!["--help"], 0, true, "Usage:".to_owned()),
+            (vec!["--not-a-real-option"], 2, false, "error".to_owned()),
+        ] {
+            let (mut cmd, out, err) = nested_command(
+                &fixture,
+                &format!("run-{status}-{stream}"),
+                &root().join("scripts/winter-cli"),
+            );
+            cmd.args(arguments);
+            let mut guard = NestedGuard::start(&mut cmd);
+            let observed = guard
+                .wait_until(Instant::now() + Duration::from_secs(180))
+                .unwrap_or_else(|| {
+                    let _ = guard.cancel();
+                    panic!("nested wrapper timed out")
+                });
+            assert_eq!(
+                observed.code(),
+                Some(status),
+                "{}",
+                String::from_utf8_lossy(&fs::read(&err).unwrap())
+            );
+            let output = if stream {
+                fs::read(out).unwrap()
+            } else {
+                fs::read(err).unwrap()
+            };
+            assert!(
+                String::from_utf8_lossy(&output).contains(&expected),
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+            assert!(!marker.exists());
+        }
+    }
 
     fn args(a: &[&str]) -> Vec<OsString> {
         a.iter().map(OsString::from).collect()
