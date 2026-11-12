@@ -1,4 +1,35 @@
 //! Isolated, bounded subprocess fixtures for Winter's tests.
+//!
+//! [`RuntimeFixture`] owns a fresh temporary runtime tree and creates an [`Invocation`]
+//! with isolated working, home, XDG, temporary and PATH directories. Keep the fixture
+//! alive through [`invoke`]; dropping it removes the tree. `BLIZZARD_TMPDIR`, when
+//! set in the test process, selects the parent for fixture and capture directories.
+//! The child receives only the invocation's explicit environment, not the build
+//! environment. Tests may add only the runtime inputs they need.
+//!
+//! [`invoke`] requires absolute executable and working-directory paths and a nonzero
+//! timeout. It captures raw stdin, stdout and stderr, limits each output to 1 MiB,
+//! and reports exit codes or signals in [`Observation`]. A nonzero child exit is an
+//! observation, not itself a harness failure. [`InvocationFailure`] retains available
+//! output, termination and cleanup diagnostics. On failure or unwind the guard
+//! attempts to kill and reap its direct child; it does not own arbitrary descendants
+//! or process groups. Tests creating descendants must arrange their own bounded cleanup.
+//! [`Completion::SignalAfterStdout`] signals only the owned child after its marker;
+//! [`ReplyStream`] can make a reply descriptor reject writes.
+//!
+//! The `winter-dev` binary is a private build/test driver, not part of this library's
+//! public API. It owns its Cargo child process groups and selects artifacts using Cargo
+//! metadata and JSON. Build-time Cargo configuration, flags and caches are not the
+//! isolated child runtime environment. The driver supplies service tests with
+//! `WINTER_TEST_CLI_PATH` (absolute file), `WINTER_TEST_EXPECTED_VERSION` (nonempty),
+//! and `WINTER_TEST_PROCESS_SCOPE` (driver PID for scope validation). Development also
+//! requires `WINTER_TEST_SAMPLE_PATH` (absolute file); production requires it absent.
+//! Service tests must run through the driver, which establishes the process scope.
+//!
+//! Put shared subprocess support in this library, in-process facade tests in
+//! `tests/component.rs`, executable tests in `tests/service.rs`, and driver-specific
+//! mechanics in the private driver. See the repository [README](../../../README.md)
+//! for bootstrap, commands, tiers and manual verification.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;

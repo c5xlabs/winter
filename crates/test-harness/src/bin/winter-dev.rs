@@ -1022,21 +1022,75 @@ mod tests {
     }
     #[test]
     fn group_cleanup_stops_descendants_even_after_parent_exit() {
+        fn live(pid: libc::pid_t) -> bool {
+            let status = Command::new("/bin/ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .expect("inspect descendant state");
+            let state = String::from_utf8_lossy(&status.stdout);
+            !state.trim().is_empty() && !state.trim_start().starts_with('Z')
+        }
+        // This guard is independent of Group, and remains outside the fixture's
+        // group. It also runs on assertion failure when cleanup is broken.
+        struct Emergency(PathBuf);
+        impl Drop for Emergency {
+            fn drop(&mut self) {
+                let Ok(data) = fs::read_to_string(&self.0) else {
+                    return;
+                };
+                let ids: Vec<libc::pid_t> = data
+                    .split_whitespace()
+                    .filter_map(|s| s.parse().ok())
+                    .collect();
+                if let [pgid, descendant] = ids.as_slice()
+                    && *pgid > 0
+                    && *descendant > 0
+                    && *pgid != unsafe { libc::getpgrp() }
+                    && unsafe { libc::getpgid(*descendant) } == *pgid
+                {
+                    unsafe { libc::kill(-*pgid, libc::SIGKILL) };
+                    let deadline = Instant::now() + REAP;
+                    while live(*descendant) && Instant::now() < deadline {
+                        thread::sleep(POLL);
+                    }
+                }
+            }
+        }
         let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("marker");
+        let ids = dir.path().join("ids");
+        let _emergency = Emergency(ids.clone());
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c")
-            .arg("(/bin/sleep 0.3; printf bad > \"$1\") & exit 0")
+            .arg("/bin/sleep 30 & child=$!; printf '%s %s\\n' \"$$\" \"$child\" > \"$1\"; kill -0 \"$child\" || exit 1; exit 0")
             .arg("sh")
-            .arg(&marker);
+            .arg(&ids);
         assert!(
             run(&mut cmd, &AtomicBool::new(false), Duration::from_secs(3))
                 .unwrap()
                 .status
                 .success()
         );
-        thread::sleep(Duration::from_millis(500));
-        assert!(!marker.exists());
+        let data = fs::read_to_string(&ids).unwrap();
+        let ids: Vec<libc::pid_t> = data
+            .split_whitespace()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids[0] > 0 && ids[1] > 0 && ids[0] != unsafe { libc::getpgrp() });
+        let deadline = Instant::now() + REAP;
+        loop {
+            // An orphan may remain as a zombie until init reaps it; it is not live.
+            if !live(ids[1]) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "orphan descendant {} remains live in group {}",
+                ids[1],
+                ids[0]
+            );
+            thread::sleep(POLL);
+        }
     }
     #[test]
     fn child_and_fixture_inherit_owned_group() {
