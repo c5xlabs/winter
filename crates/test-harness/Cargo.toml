@@ -6,6 +6,8 @@ publish = false
 rust-version.workspace = true
 
 [dependencies]
+libc = "0.2.191"
+tempfile = "3.27.0"
 winter-platform.workspace = true
 
 [features]
