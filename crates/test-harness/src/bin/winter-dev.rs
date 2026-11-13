@@ -47,6 +47,16 @@ fn parse(args: &[OsString]) -> Result<Task, &'static str> {
             Err("expected run -- [ARG...]")
         };
     }
+    if args.first().is_some_and(|x| x == "sample") {
+        // `cargo dev sample -- ARG...` is `run -- sample ARG...`.
+        return if args.get(1).is_some_and(|x| x == "--") {
+            let mut tail = vec![OsString::from("sample")];
+            tail.extend_from_slice(&args[2..]);
+            Ok(Task::Run(tail))
+        } else {
+            Err("expected sample -- [ARG...]")
+        };
+    }
     let (tier, mut i) = match args.first().and_then(|s| s.to_str()) {
         Some("build") => (None, 1),
         Some("test") => (
@@ -58,7 +68,7 @@ fn parse(args: &[OsString]) -> Result<Task, &'static str> {
             }),
             2,
         ),
-        _ => return Err("expected build, test, or run"),
+        _ => return Err("expected build, test, run, or sample"),
     };
     let mut config = None;
     let mut filter = None;
@@ -641,6 +651,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::AtomicBool;
@@ -1007,6 +1018,57 @@ mod tests {
         );
     }
 
+    // Drives the built driver with `sample -- ...`: the sample must be the driver's own
+    // process (same PID), with no supervising parent and an exact raw tail.
+    #[test]
+    fn real_sample_demonstration_replaces_driver() {
+        let fixture = RuntimeFixture::new().unwrap();
+        let cancel = AtomicBool::new(false);
+        let meta = metadata(&root(), Configuration::Development, &cancel).unwrap();
+        let driver = build_one(
+            &root(),
+            Configuration::Development,
+            &meta,
+            "winter-test-harness",
+            "winter-dev",
+            &cancel,
+        )
+        .unwrap();
+        let (mut cmd, out, err) = nested_command(&fixture, "sample", &driver);
+        cmd.arg("sample")
+            .arg("--")
+            .arg("inspect")
+            .arg("--")
+            .arg(OsString::from_vec(vec![0xff]));
+        let mut guard = NestedGuard::start(&mut cmd);
+        let pid = guard.pid;
+        let observed = guard
+            .wait_until(Instant::now() + Duration::from_secs(180))
+            .unwrap_or_else(|| {
+                let _ = guard.cancel();
+                panic!("nested sample timed out")
+            });
+        let stderr = String::from_utf8_lossy(&fs::read(&err).unwrap()).into_owned();
+        assert_eq!(observed.code(), Some(0), "{stderr}");
+        let record: Value = serde_json::from_slice(&fs::read(out).unwrap()).unwrap();
+        assert_eq!(record["pid"], pid);
+        let argv0 = hex_decode(record["argv0_hex"].as_str().unwrap());
+        assert!(Path::new(OsStr::from_bytes(&argv0)).is_absolute());
+        assert!(argv0.ends_with(b"winter-dev-sample"));
+        assert!(record["env_hex"]["WINTER_DEV_SAMPLE_PATH"].is_null());
+        assert_eq!(
+            record["args_hex"],
+            serde_json::json!(["696e7370656374", "2d2d", "ff"])
+        );
+    }
+
+    fn hex_decode(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
     #[test]
     fn real_wrapper_uses_checkout_from_unrelated_directory() {
         let fixture = RuntimeFixture::new().unwrap();
@@ -1090,8 +1152,29 @@ mod tests {
             parse(&args(&["run", "--", "--help"])),
             Ok(Task::Run(vec!["--help".into()]))
         );
+        assert_eq!(
+            Ok(Task::Run(vec![
+                "sample".into(),
+                "inspect".into(),
+                "--x".into(),
+                OsString::from_vec(vec![0xff]),
+            ])),
+            parse(&[
+                "sample".into(),
+                "--".into(),
+                "inspect".into(),
+                "--x".into(),
+                OsString::from_vec(vec![0xff]),
+            ])
+        );
+        assert_eq!(
+            parse(&args(&["sample", "--"])),
+            Ok(Task::Run(vec!["sample".into()]))
+        );
         for invalid in [
             vec![],
+            vec!["sample"],
+            vec!["sample", "x"],
             vec!["test", "unit"],
             vec!["build", "--configuration", "bad"],
             vec!["run"],

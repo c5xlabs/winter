@@ -1,3 +1,5 @@
+# To run this checkout's CLI (e.g. check its version) use the absolute path to scripts/winter-cli, not a prebuilt
+# target/ binary or an installed winter. It selects this checkout's toolchain and manifest; see README.md (Development).
 [package]
 name = "winter-cli"
 version.workspace = true

@@ -5,6 +5,8 @@ use std::os::fd::FromRawFd;
 use std::process::ExitCode;
 
 use winter_platform::{CliIdentity, Reply, Request, control_reply, parse, usage_reply};
+#[cfg(feature = "dev-sample")]
+use winter_platform::{SAMPLE_PATH_ENV, UnixProcess, launch_failure_reply, run_sample};
 
 fn main() -> ExitCode {
     let identity = CliIdentity {
@@ -12,6 +14,14 @@ fn main() -> ExitCode {
     };
     let reply = match parse(std::env::args_os(), &identity) {
         Ok(Request::Control(control)) => control_reply(control, identity),
+        #[cfg(feature = "dev-sample")]
+        Ok(Request::Sample(request)) => {
+            let path = std::env::var_os(SAMPLE_PATH_ENV);
+            match run_sample(request, path, &mut UnixProcess) {
+                Ok(never) => match never {},
+                Err(error) => launch_failure_reply(error),
+            }
+        }
         Err(error) => usage_reply(error),
     };
     // Use the inherited descriptors directly: std's stdout/stderr wrappers intentionally
