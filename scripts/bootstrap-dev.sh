@@ -11,16 +11,16 @@ die() {
 	exit 1
 }
 
-# 2. Prerequisites (see README "Development").
+# 2. Prerequisites (see context/tooling/development.md).
 for tool in rustup cc curl tar; do
-	command -v "$tool" >/dev/null 2>&1 || die "missing prerequisite '$tool'; see README.md"
+	command -v "$tool" >/dev/null 2>&1 || die "missing prerequisite '$tool'; see context/tooling/development.md"
 done
 if command -v sha256sum >/dev/null 2>&1; then
 	sha_check=(sha256sum -c)
 elif command -v shasum >/dev/null 2>&1; then
 	sha_check=(shasum -a 256 -c)
 else
-	die "missing prerequisite 'sha256sum' or 'shasum'; see README.md"
+	die "missing prerequisite 'sha256sum' or 'shasum'; see context/tooling/development.md"
 fi
 
 # 3. Pins: parsed, never sourced.

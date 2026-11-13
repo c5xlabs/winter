@@ -1,7 +1,7 @@
 //! Workspace dependency-boundary checker.
 //!
-//! The allowlist below is the executable form of the package table in the CLI
-//! foundation system specification. Changing it is an architectural decision: edit it
+//! The allowlist below is the executable form of the package table in
+//! `context/architecture/structure.md`. Changing it is an architectural decision: edit it
 //! together with that table.
 //!
 //! The functions are pure over [`cargo_metadata::Metadata`] (as produced by

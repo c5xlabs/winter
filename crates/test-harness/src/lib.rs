@@ -35,8 +35,8 @@
 //!
 //! Put shared subprocess support in this library, in-process facade tests in
 //! `tests/component.rs`, executable tests in `tests/service.rs`, and driver-specific
-//! mechanics in the private driver. See the repository [README](../../../README.md)
-//! for bootstrap, commands, tiers and manual verification.
+//! mechanics in the private driver. See the repository [development guide](../../../context/tooling/development.md)
+//! for bootstrap, commands and tiers, and the [verification matrix](../../../context/verification/matrix.md).
 
 pub mod architecture;
 
