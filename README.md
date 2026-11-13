@@ -210,7 +210,8 @@ status` is clean at the end.
    - each of these `crates/cli/Cargo.toml` edges → `architecture-allowlist`, with package names and kind or condition in
      the diagnostic: `[target.'cfg(windows)'.dependencies]` with `harness = { package = "winter-test-harness", path =
      "../test-harness", optional = true }`, a `[build-dependencies]` edge to `winter-dev-sample`, and a
-     `[dev-dependencies]` edge to `winter-test-harness`
+     `[dev-dependencies]` edge to `winter-test-harness`. After each edit run `cargo metadata --offline >/dev/null` so
+     the locked driver still builds, and restore `Cargo.lock` too.
 3. `cargo dev format` on a misformatted tree leaves files byte-identical (compare `git diff --stat` before and after);
    `cargo dev format --write` fixes them.
 4. Pinned-tool failures: renaming `.tools/bin/rumdl` makes `cargo dev lint` exit 1 with bootstrap guidance and download
