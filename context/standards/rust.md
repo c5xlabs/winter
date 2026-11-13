@@ -10,6 +10,7 @@ A finished change meets each rule.
 - **Errors:** `thiserror` enums or structs that carry context. No stringly errors across the facade.
 - **No panics on user input:** no `panic!`, `unwrap` or `expect` on input a user can supply. Panics are allowed for
   internal invariants and in tests.
-- **`unsafe`:** only with a comment that justifies it, as in `crates/cli/src/main.rs` and `crates/dev-sample/src/main.rs`.
+- **`unsafe`:** only with a comment that justifies it, as in `crates/cli/src/main.rs` and
+  `crates/dev-sample/src/main.rs`.
 - **Warnings** are errors. `winter:lint` and `winter:format-check` enforce Clippy and rustfmt.
 - **Feature gating:** gate code with `#[cfg(feature = "dev-sample")]`, and keep production free of the sample.
