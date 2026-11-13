@@ -22,6 +22,7 @@ cargo dev test component --configuration development
 cargo dev test service --configuration production
 cargo dev test service --configuration development --filter executable_help_and_version
 cargo dev run -- --help
+cargo dev sample -- inspect
 ./scripts/winter-cli --version
 ```
 
@@ -32,6 +33,12 @@ tests exercise built executables in isolated subprocess fixtures. Run both confi
 checking a change. Development enables the test-only sample; production excludes it. `run --` builds development
 artifacts and executes the checkout CLI, forwarding arguments, working directory, streams and process context. The
 wrapper does the same from any working directory, selecting this checkout's pinned toolchain and manifest.
+
+`winter sample [ARG...]` exists only in the development configuration. It hands everything after `sample` to the
+development sample executable byte-for-byte, replacing the `winter` process (same PID, no supervising parent). The
+driver injects `WINTER_DEV_SAMPLE_PATH` with the absolute sample path; do not set it by hand or use an installed
+`winter`. `cargo dev sample -- ARG...` is shorthand for `cargo dev run -- sample ARG...`. Production rejects `sample` as
+an unknown command and never reads that variable.
 
 The driver uses `target/verification/production` and `target/verification/development`, separate from one another and
 from ordinary Cargo targets, with warnings denied. It selects binaries from Cargo metadata and compiler-artifact JSON,
@@ -63,7 +70,8 @@ path to `scripts/winter-cli` rather than an unqualified `winter`; an installed w
 | ID                           | Exercise                                                                                               |
 | ---------------------------- | ------------------------------------------------------------------------------------------------------ |
 | `winter:manual`              | Perform the terminal exercise below for production artifact selection, isolation and wrapper behavior. |
-| `winter:manual-context-eval` | Run the two cold-agent discovery scenarios below.                                                      |
+| `winter:manual-sample`       | Perform the development sample exercise below.                                                         |
+| `winter:manual-context-eval` | Run the three cold-agent discovery scenarios below.                                                    |
 
 The following exercise needs Python 3 in addition to the host prerequisites. Run from the checkout root after bootstrap.
 It selects the production executable by package ID and bin target from Cargo's JSON, so a configured cross-target path
@@ -121,6 +129,25 @@ Confirm help and version are printed, the production `sample` request is rejecte
 unexpected runtime files appear. The wrapper must print this checkout's version despite the conflicting toolchain and
 PATH decoy. Remove the printed temporary tree when finished.
 
+#### Development sample exercise
+
+Run from the checkout root after bootstrap, in an interactive shell.
+
+1. `cargo dev sample -- inspect --help $'\xff'` prints one JSON line. Its `args_hex` is
+   `["696e7370656374","2d2d68656c70","ff"]`, `env_hex.WINTER_DEV_SAMPLE_PATH` is `null`, and `cwd_hex` is the current
+   directory.
+2. `cargo dev sample -- --help` prints the sample usage. `cargo dev sample -- -- --help; echo $?` prints `2`, and `cargo
+   dev sample -- exit 7; echo $?` prints `7`.
+3. Run `cargo dev sample -- wait &`. After `ready` appears, `ps -o pid,ppid,comm -C winter-dev-sample` shows the sample
+   in place of `winter`; its parent is Cargo and no `winter` or `winter-dev` process is in its ancestry. Send it `kill
+   -TERM` and confirm it ends by SIGTERM.
+4. Build the development CLI and select it by package ID from Cargo JSON, as in the production exercise but with
+   `--features dev-sample` and the `development` target directory. Then `env -u WINTER_DEV_SAMPLE_PATH "$cli" sample`
+   and `WINTER_DEV_SAMPLE_PATH=rel "$cli" sample` each exit 1 with a `development sample handoff failed` diagnostic and
+   empty stdout.
+5. Repeat steps 1 and 2 with the network disabled (for example `unshare -rn`) to confirm they need no network after
+   bootstrap. If the host has no usable network-isolation tool, record this step as not run and say why.
+
 #### Cold-agent context evaluation
 
 Run each scenario in a separate, fresh foreground agent session with the normal workspace instructions and discovery
@@ -135,6 +162,10 @@ Verification inventory. Record that route and the actual files consulted for eac
   - **Behaved:** It uses the checkout driver for the development service tier with an appropriate test-name filter, not
     the service test target directly. The driver supplies the owned process scope and artifact inputs even for a
     filtered run; the agent reports what matched and does not treat zero matches as a passing test.
+- **Development sample cue:** “Show me the development sample receiving a non-UTF-8 argument from this checkout's CLI.”
+  - **Reached:** The agent discovers and reads the development sample guidance in this README through the normal route.
+  - **Behaved:** It uses `cargo dev sample -- ...` (or `cargo dev run -- sample ...`) rather than an installed `winter`
+    or a hand-set `WINTER_DEV_SAMPLE_PATH`.
 - **Checkout CLI cue:** “From an unrelated working directory, check this checkout's CLI version without changing my
   installed CLI.”
   - **Reached:** The agent discovers and reads the checkout CLI guidance in this README through the normal route.
@@ -151,6 +182,7 @@ substitute.
 
 #### Tools
 
-| ID         | Tool                                                                                               |
-| ---------- | -------------------------------------------------------------------------------------------------- |
-| `tool:cli` | `cargo dev` and `scripts/winter-cli`: checkout-local build, test and development CLI entry points. |
+| ID            | Tool                                                                                               |
+| ------------- | -------------------------------------------------------------------------------------------------- |
+| `tool:cli`    | `cargo dev` and `scripts/winter-cli`: checkout-local build, test and development CLI entry points. |
+| `tool:sample` | `cargo dev sample -- inspect`: development-only demonstration of the sample handoff.               |
