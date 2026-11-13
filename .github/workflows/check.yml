@@ -31,8 +31,15 @@ jobs:
           key: tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dev-tools.env', 'dprint.json', 'rust-toolchain.toml') }}-${{ github.run_id }}
           restore-keys: |
             tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dev-tools.env', 'dprint.json', 'rust-toolchain.toml') }}-
+      # Cold bootstrap compiles dprint and rumdl from source. Cutting link-time optimization and
+      # using more codegen units keeps that inside the time limit on the slowest host; the
+      # installed versions are unchanged and bootstrap still verifies them.
       - run: ./scripts/bootstrap-dev.sh
         timeout-minutes: 24
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "off"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+          CARGO_PROFILE_RELEASE_DEBUG: "false"
       - if: always() && steps.cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
