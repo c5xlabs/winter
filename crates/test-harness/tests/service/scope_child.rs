@@ -93,7 +93,9 @@ impl GroupChild {
         }
         if unsafe { libc::kill(-pid, libc::SIGKILL) } != 0 {
             let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
+            // macOS reports EPERM for a group whose only members are zombies; the
+            // liveness check that follows still requires the group to be gone.
+            if !matches!(error.raw_os_error(), Some(libc::ESRCH | libc::EPERM)) {
                 return Err(error);
             }
         }

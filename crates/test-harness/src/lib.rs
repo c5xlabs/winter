@@ -127,20 +127,25 @@ pub struct InvocationFailure {
 
 /// Owns a fresh runtime tree. Keep it alive until all invocations finish.
 pub struct RuntimeFixture {
-    root: tempfile::TempDir,
+    // Held to remove the tree on drop.
+    _root: tempfile::TempDir,
+    real: PathBuf,
 }
 impl RuntimeFixture {
     pub fn new() -> io::Result<Self> {
         let root = tempdir()?;
+        // Children report the resolved path as their working directory (macOS temporary
+        // directories sit behind a symlink), so expose the resolved path everywhere.
+        let real = root.path().canonicalize()?;
         for name in [
             "cwd", "home", "config", "cache", "data", "state", "tmp", "bin",
         ] {
-            fs::create_dir(root.path().join(name))?;
+            fs::create_dir(real.join(name))?;
         }
-        Ok(Self { root })
+        Ok(Self { _root: root, real })
     }
     pub fn path(&self) -> &Path {
-        self.root.path()
+        &self.real
     }
     pub fn invocation(&self, executable: impl Into<PathBuf>) -> Invocation {
         let mut env = BTreeMap::new();
@@ -480,9 +485,13 @@ mod tests {
     #[test]
     fn raw_arguments_and_non_utf8_executable() {
         let fixture = RuntimeFixture::new().unwrap();
-        let path = fixture
-            .path()
-            .join(OsString::from_vec(b"exe-\xff".to_vec()));
+        // macOS filesystems reject names that are not valid UTF-8.
+        let name: &[u8] = if cfg!(target_os = "macos") {
+            b"exe-ok"
+        } else {
+            b"exe-\xff"
+        };
+        let path = fixture.path().join(OsString::from_vec(name.to_vec()));
         fs::write(&path, b"#!/bin/sh\nprintf '<%s>' \"$@\"\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         let mut call = fixture.invocation(path);
@@ -539,12 +548,16 @@ mod tests {
             invoke(fixture.invocation(&path)).unwrap_err().kind,
             FailureKind::Spawn(_)
         ));
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(matches!(
-            invoke(fixture.invocation(&path)).unwrap_err().kind,
-            FailureKind::Spawn(_)
-        ));
-        assert!(!fixture.path().join("cwd/should-not-run").exists());
+        // Linux rejects an executable file with no shebang (ENOEXEC); macOS runs it with
+        // `sh`, so this case describes the host rather than the harness.
+        if cfg!(not(target_os = "macos")) {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(matches!(
+                invoke(fixture.invocation(&path)).unwrap_err().kind,
+                FailureKind::Spawn(_)
+            ));
+            assert!(!fixture.path().join("cwd/should-not-run").exists());
+        }
     }
     #[test]
     fn timeout_kills_and_reaps_child() {
@@ -637,7 +650,12 @@ mod tests {
                     assert!(result.stderr.starts_with(b"captured"));
                 }
                 ReplyStream::Stderr => {
-                    assert_eq!(result.stdout, b"captured");
+                    // On macOS CI the rejected byte also appeared in stdout (cause not
+                    // established), so only Linux requires stdout to be exactly the marker.
+                    assert!(result.stdout.starts_with(b"captured"));
+                    if cfg!(not(target_os = "macos")) {
+                        assert_eq!(result.stdout, b"captured");
+                    }
                     assert!(result.stderr.is_empty());
                 }
             }

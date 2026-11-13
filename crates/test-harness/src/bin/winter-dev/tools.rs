@@ -120,7 +120,16 @@ pub fn preflight(root: &Path, tool: Tool, cancel: &AtomicBool) -> Result<PathBuf
     }
     let mut cmd = Command::new(&path);
     cmd.arg(tool.probe()).current_dir(root);
-    let found = match run(&mut cmd, cancel, PROBE) {
+    // A tool being written by a concurrent installer or test can be briefly busy to exec.
+    let mut probed = run(&mut cmd, cancel, PROBE);
+    for _ in 0..5 {
+        if !matches!(&probed, Err(e) if e.contains("Text file busy")) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        probed = run(&mut cmd, cancel, PROBE);
+    }
+    let found = match probed {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
         Ok(out) => return Err(missing(&format!("version probe failed: {}", out.status))),
         Err(e) => return Err(missing(&format!("version probe failed: {e}"))),

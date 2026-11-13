@@ -187,7 +187,9 @@ impl Group {
         }
         if unsafe { libc::kill(-self.pgid, libc::SIGKILL) } != 0 {
             let e = io::Error::last_os_error();
-            if e.raw_os_error() != Some(libc::ESRCH) {
+            // macOS reports EPERM for a group whose only members are zombies; the
+            // liveness check below still requires the group to be gone.
+            if !matches!(e.raw_os_error(), Some(libc::ESRCH | libc::EPERM)) {
                 return Err(e);
             }
         }
