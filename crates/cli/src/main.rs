@@ -1,6 +1,7 @@
 //! The `winter` executable: composition root and sole owner of the process streams.
 
-use std::io::{self, Write};
+use std::io::Write;
+use std::os::fd::FromRawFd;
 use std::process::ExitCode;
 
 use winter_platform::{CliIdentity, Reply, Request, control_reply, parse, usage_reply};
@@ -13,7 +14,11 @@ fn main() -> ExitCode {
         Ok(Request::Control(control)) => control_reply(control, identity),
         Err(error) => usage_reply(error),
     };
-    let code = write_reply(&reply, &mut io::stdout().lock(), &mut io::stderr().lock());
+    // Use the inherited descriptors directly: std's stdout/stderr wrappers intentionally
+    // suppress EBADF, but reply-write failures are part of the executable contract.
+    let mut stdout = unsafe { std::fs::File::from_raw_fd(1) };
+    let mut stderr = unsafe { std::fs::File::from_raw_fd(2) };
+    let code = write_reply(&reply, &mut stdout, &mut stderr);
     ExitCode::from(code)
 }
 
@@ -37,6 +42,7 @@ fn write_reply(reply: &Reply, out: &mut impl Write, err: &mut impl Write) -> u8 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
 
     struct FailWrite;
     impl Write for FailWrite {

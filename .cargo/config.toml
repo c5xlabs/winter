@@ -1,0 +1,2 @@
+[alias]
+dev = "run --locked --offline -p winter-test-harness --bin winter-dev --"
