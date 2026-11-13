@@ -2,6 +2,9 @@
 
 Winter platform CLI launcher
 
+To run this checkout's CLI (for example to check its version) without touching an installed `winter`, use the absolute
+path to `scripts/winter-cli`; see Development below.
+
 ## Development
 
 Host prerequisites: rustup 1.28 or newer, a C linker toolchain (`cc`), Bash, curl, tar, and `sha256sum` or `shasum`.
@@ -139,8 +142,8 @@ Run from the checkout root after bootstrap, in an interactive shell.
 2. `cargo dev sample -- --help` prints the sample usage. `cargo dev sample -- -- --help; echo $?` prints `2`, and `cargo
    dev sample -- exit 7; echo $?` prints `7`.
 3. Run `cargo dev sample -- wait &`. After `ready` appears, `ps -o pid,ppid,comm -C winter-dev-sample` shows the sample
-   in place of `winter`; its parent is Cargo and no `winter` or `winter-dev` process is in its ancestry. Send it `kill
-   -TERM` and confirm it ends by SIGTERM.
+   in place of `winter`; its parent is whatever launched `cargo dev` (Cargo replaces itself), and no `winter` or
+   `winter-dev` process is in its ancestry. Send it `kill -TERM` and confirm it ends by SIGTERM.
 4. Build the development CLI and select it by package ID from Cargo JSON, as in the production exercise but with
    `--features dev-sample` and the `development` target directory. Then `env -u WINTER_DEV_SAMPLE_PATH "$cli" sample`
    and `WINTER_DEV_SAMPLE_PATH=rel "$cli" sample` each exit 1 with a `development sample handoff failed` diagnostic and
