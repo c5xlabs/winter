@@ -1,0 +1,30 @@
+name: check
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The cache only saves setup time. Bootstrap still verifies every pinned tool version.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .tools
+            ~/.cache/dprint
+            ~/Library/Caches/Dprint
+          key: tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dev-tools.env', 'dprint.json', 'rust-toolchain.toml') }}
+      - run: ./scripts/bootstrap-dev.sh
+      - run: cargo dev check

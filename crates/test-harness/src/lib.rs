@@ -26,10 +26,19 @@
 //! requires `WINTER_TEST_SAMPLE_PATH` (absolute file); production requires it absent.
 //! Service tests must run through the driver, which establishes the process scope.
 //!
+//! The public [`architecture`] module is the workspace dependency-boundary checker: pure
+//! functions over `cargo metadata --no-deps` output, with its allowlist and self-tests.
+//! The driver is the composition root that runs Cargo, calls the checker and renders
+//! diagnostics. Besides `build`, `test`, `run` and `sample`, it offers `check` (the one
+//! ordered list of named gates that CI runs), `format [--write]`, `lint` and
+//! `architecture`; only `format --write` rewrites files.
+//!
 //! Put shared subprocess support in this library, in-process facade tests in
 //! `tests/component.rs`, executable tests in `tests/service.rs`, and driver-specific
 //! mechanics in the private driver. See the repository [README](../../../README.md)
 //! for bootstrap, commands, tiers and manual verification.
+
+pub mod architecture;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;

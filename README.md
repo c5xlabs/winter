@@ -24,6 +24,11 @@ cargo dev test unit --configuration production
 cargo dev test component --configuration development
 cargo dev test service --configuration production
 cargo dev test service --configuration development --filter executable_help_and_version
+cargo dev check
+cargo dev format
+cargo dev format --write
+cargo dev lint
+cargo dev architecture
 cargo dev run -- --help
 cargo dev sample -- inspect
 ./scripts/winter-cli --version
@@ -36,6 +41,38 @@ tests exercise built executables in isolated subprocess fixtures. Run both confi
 checking a change. Development enables the test-only sample; production excludes it. `run --` builds development
 artifacts and executes the checkout CLI, forwarding arguments, working directory, streams and process context. The
 wrapper does the same from any working directory, selecting this checkout's pinned toolchain and manifest.
+
+`cargo dev check` is the full local gate and is exactly what CI runs. It runs one ordered list of named operations:
+`rustfmt-check`, `dprint-check`, `clippy-production`, `clippy-development`, `rumdl`, `actionlint`,
+`bash-syntax-bootstrap`, `bash-syntax-winter-cli`, `architecture-self-test`, `architecture-allowlist`,
+`build-production`, `build-development`, then the unit, component and service tiers in both configurations. It prints
+`winter-dev: [i/N] <name>` before each operation and `ok` or `FAILED` after it with the failed operation's retained
+diagnostics, keeps going after a failure, and ends with `winter-dev: failed checks: <names>` and exit 1. `format`,
+`lint` and `architecture` run their slice of the same list. They and `check` never rewrite files; only `cargo dev format
+--write` does (`cargo fmt --all` and `dprint fmt`). Extra arguments are a usage error (exit 2); failed checks, missing
+prerequisites, timeouts and orchestration failures exit 1.
+
+Before using a pinned tool, the driver verifies it with a bounded version probe of `.tools/bin/<tool>` against
+`dev-tools.env`, and checks that `cargo fmt` and `cargo clippy` exist in the pinned toolchain. A missing or mismatched
+tool fails with the expected pin, what was found, and `run ./scripts/bootstrap-dev.sh (network required)`; the driver
+never installs or downloads anything (`RUSTUP_AUTO_INSTALL=0`, and dprint runs with a closed proxy so a missing plugin
+cache entry fails with the same guidance). actionlint runs with its shellcheck and pyflakes integrations disabled, so
+unrelated tools on `PATH` cannot change the result. After bootstrap `cargo dev check` runs offline and without services.
+Focused `cargo dev test <tier> --configuration <c> --filter TEXT` remains the quick feedback loop: it runs one tier and
+reuses the same build artifacts as the full gate.
+
+The architecture check (`cargo dev architecture`) first runs the checker's self-tests, then applies the allowlist to the
+workspace's `cargo metadata --no-deps` output: platform depends on nothing, `winter-cli` and `winter-test-harness` on
+`winter-platform` only, `winter-dev-sample` on nothing. Every declared workspace edge counts, whatever its kind (normal,
+dev or build), `optional`, rename or target condition, and the workspace must have exactly these four members. Each
+diagnostic names both packages and the kind, optional, target and alias of the edge. To change a boundary, edit the
+allowlist in `crates/test-harness/src/architecture.rs` together with the package table in the system specification, as
+an architectural decision.
+
+CI (`.github/workflows/check.yml`) runs on push and pull request with read-only repository permissions on
+`ubuntu-24.04`, `ubuntu-24.04-arm`, `macos-15` and `macos-15-intel`. Each job bootstraps (reusing a cache of `.tools`
+and the dprint plugin cache that bootstrap still verifies) and runs `cargo dev check` unchanged. It has no secrets,
+release triggers, publication, signing, Homebrew or installed Winter; release readiness is a separate concern.
 
 `winter sample [ARG...]` exists only in the development configuration. It hands everything after `sample` to the
 development sample executable byte-for-byte, replacing the `winter` process (same PID, no supervising parent). The
@@ -58,15 +95,16 @@ path to `scripts/winter-cli` rather than an unqualified `winter`; an installed w
 
 #### Commands
 
-| ID                           | Command                                                                                                          | Scope                                  |
-| ---------------------------- | ---------------------------------------------------------------------------------------------------------------- | -------------------------------------- |
-| `winter:build`               | `cargo dev build --configuration production` and `cargo dev build --configuration development`                   | Build each configuration.              |
-| `winter:unit-test`           | `cargo dev test unit --configuration production` and `cargo dev test unit --configuration development`           | Unit and library doctests.             |
-| `winter:component-test`      | `cargo dev test component --configuration production` and `cargo dev test component --configuration development` | In-process facade.                     |
-| `winter:service-test`        | `cargo dev test service --configuration production` and `cargo dev test service --configuration development`     | Built executable and isolated runtime. |
-| `winter:source-format-check` | `cargo fmt --all -- --check` and `.tools/bin/dprint check`                                                       | Source formatting.                     |
-| `winter:prose-config-check`  | `.tools/bin/rumdl check .`                                                                                       | Markdown and its configuration.        |
-| `winter:shell-syntax`        | `bash -n scripts/bootstrap-dev.sh scripts/winter-cli`                                                            | Shell syntax.                          |
+| ID                      | Command                                                                                                          | Scope                                                                  |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `winter:build`          | `cargo dev build --configuration production` and `cargo dev build --configuration development`                   | Build each configuration.                                              |
+| `winter:unit-test`      | `cargo dev test unit --configuration production` and `cargo dev test unit --configuration development`           | Unit and library doctests.                                             |
+| `winter:component-test` | `cargo dev test component --configuration production` and `cargo dev test component --configuration development` | In-process facade.                                                     |
+| `winter:service-test`   | `cargo dev test service --configuration production` and `cargo dev test service --configuration development`     | Built executable and isolated runtime.                                 |
+| `winter:check`          | `cargo dev check`                                                                                                | Every gate below plus build and tests.                                 |
+| `winter:format-check`   | `cargo dev format`                                                                                               | rustfmt, dprint (Markdown, JSON, TOML, workflow YAML, both scripts).   |
+| `winter:lint`           | `cargo dev lint`                                                                                                 | Clippy (both configurations), rumdl, actionlint, per-script `bash -n`. |
+| `winter:architecture`   | `cargo dev architecture`                                                                                         | Dependency allowlist and its self-tests.                               |
 
 #### Manual testing
 
@@ -74,7 +112,9 @@ path to `scripts/winter-cli` rather than an unqualified `winter`; an installed w
 | ---------------------------- | ------------------------------------------------------------------------------------------------------ |
 | `winter:manual`              | Perform the terminal exercise below for production artifact selection, isolation and wrapper behavior. |
 | `winter:manual-sample`       | Perform the development sample exercise below.                                                         |
-| `winter:manual-context-eval` | Run the three cold-agent discovery scenarios below.                                                    |
+| `winter:manual-gates`        | Perform the gate exercise below on the final tree.                                                     |
+| `winter:manual-ci`           | Perform the CI exercise below after pushing the branch.                                                |
+| `winter:manual-context-eval` | Run the four cold-agent discovery scenarios below.                                                     |
 
 The following exercise needs Python 3 in addition to the host prerequisites. Run from the checkout root after bootstrap.
 It selects the production executable by package ID and bin target from Cargo's JSON, so a configured cross-target path
@@ -151,6 +191,47 @@ Run from the checkout root after bootstrap, in an interactive shell.
 5. Repeat steps 1 and 2 with the network disabled (for example `unshare -rn`) to confirm they need no network after
    bootstrap. If the host has no usable network-isolation tool, record this step as not run and say why.
 
+#### Gate exercise
+
+Run from the checkout root after bootstrap. Restore each injected change with `git checkout -- <file>` and confirm `git
+status` is clean at the end.
+
+1. `cargo dev check` exits 0, its log shows every named operation in order, and `git status --porcelain` is unchanged.
+2. Inject one failure at a time. Each run of `cargo dev check` (or the named sub-command) exits 1 and names the right
+   operation:
+   - a rustfmt violation → `rustfmt-check`
+   - a Markdown wrap violation → `dprint-check`
+   - an unused variable → `clippy-*` and `build-*`
+   - a `clippy::needless_return` → `clippy-*`
+   - a rumdl violation → `rumdl`
+   - a workflow typo → `actionlint`
+   - a syntax error in `scripts/winter-cli` → `bash-syntax-winter-cli`
+   - a failing `assert!` in a unit test → `test-unit-*`
+   - each of these `crates/cli/Cargo.toml` edges → `architecture-allowlist`, with package names and kind or condition in
+     the diagnostic: `[target.'cfg(windows)'.dependencies]` with `harness = { package = "winter-test-harness", path =
+     "../test-harness", optional = true }`, a `[build-dependencies]` edge to `winter-dev-sample`, and a
+     `[dev-dependencies]` edge to `winter-test-harness`
+3. `cargo dev format` on a misformatted tree leaves files byte-identical (compare `git diff --stat` before and after);
+   `cargo dev format --write` fixes them.
+4. Pinned-tool failures: renaming `.tools/bin/rumdl` makes `cargo dev lint` exit 1 with bootstrap guidance and download
+   nothing; `RUMDL_VERSION=0.0.0` in a scratch edit of `dev-tools.env` gives a mismatch diagnostic; pointing
+   `DPRINT_CACHE_DIR` at an empty directory makes `cargo dev format` fail with plugin-cache guidance and leaves that
+   directory without plugins.
+5. With executable marker-writing `shellcheck` and `pyflakes` files first on `PATH`, `cargo dev lint` writes no marker.
+6. Run `cargo dev check` with the network disabled (`unshare -rn` where permitted; otherwise proxy variables pointed at
+   a closed loopback port, and record which): it passes. Then `cargo dev test unit --configuration production --filter
+   architecture` runs only that tier with no `Compiling` lines for unchanged crates and no format or lint sweep.
+
+#### CI exercise
+
+1. Push the branch. With `gh run list --branch <branch>` and `gh run view <id>`, all four matrix jobs succeed, and each
+   log shows bootstrap followed by the same `winter-dev: [i/N] ...` operation sequence.
+2. Read `.github/workflows/check.yml`: no secrets, release or tag triggers, or publish steps, and the job token is
+   `contents: read`.
+3. Push one commit with a single injected rustfmt violation to a throwaway branch, never the feature branch. Each job
+   fails, the log names `rustfmt-check` with its diff and the final `failed checks` line. Delete the throwaway branch
+   with `git push origin --delete <branch>`.
+
 #### Cold-agent context evaluation
 
 Run each scenario in a separate, fresh foreground agent session with the normal workspace instructions and discovery
@@ -169,6 +250,11 @@ Verification inventory. Record that route and the actual files consulted for eac
   - **Reached:** The agent discovers and reads the development sample guidance in this README through the normal route.
   - **Behaved:** It uses `cargo dev sample -- ...` (or `cargo dev run -- sample ...`) rather than an installed `winter`
     or a hand-set `WINTER_DEV_SAMPLE_PATH`.
+- **Local verification cue:** “Run this checkout's full local verification before I push and tell me what failed.”
+  - **Reached:** The agent discovers and reads the Development and Verification inventory guidance in this README
+    through the normal route.
+  - **Behaved:** It runs `cargo dev check` rather than ad hoc cargo, dprint or rumdl invocations, and reports the named
+    failed checks from its summary line.
 - **Checkout CLI cue:** “From an unrelated working directory, check this checkout's CLI version without changing my
   installed CLI.”
   - **Reached:** The agent discovers and reads the checkout CLI guidance in this README through the normal route.

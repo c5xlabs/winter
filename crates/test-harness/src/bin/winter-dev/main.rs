@@ -14,6 +14,9 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod checks;
+mod tools;
+
 const DEADLINE: Duration = Duration::from_secs(15 * 60);
 const REAP: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(10);
@@ -37,6 +40,10 @@ enum Task {
     Build(Configuration),
     Test(Tier, Configuration, Option<OsString>),
     Run(Vec<OsString>),
+    Check,
+    Format { write: bool },
+    Lint,
+    Architecture,
 }
 
 fn parse(args: &[OsString]) -> Result<Task, &'static str> {
@@ -57,6 +64,25 @@ fn parse(args: &[OsString]) -> Result<Task, &'static str> {
             Err("expected sample -- [ARG...]")
         };
     }
+    if let Some(verb @ ("check" | "lint" | "architecture")) = args.first().and_then(|s| s.to_str())
+    {
+        return if args.len() == 1 {
+            Ok(match verb {
+                "check" => Task::Check,
+                "lint" => Task::Lint,
+                _ => Task::Architecture,
+            })
+        } else {
+            Err("this command takes no arguments")
+        };
+    }
+    if args.first().is_some_and(|x| x == "format") {
+        return match &args[1..] {
+            [] => Ok(Task::Format { write: false }),
+            [flag] if flag == "--write" => Ok(Task::Format { write: true }),
+            _ => Err("expected format [--write]"),
+        };
+    }
     let (tier, mut i) = match args.first().and_then(|s| s.to_str()) {
         Some("build") => (None, 1),
         Some("test") => (
@@ -68,7 +94,7 @@ fn parse(args: &[OsString]) -> Result<Task, &'static str> {
             }),
             2,
         ),
-        _ => return Err("expected build, test, run, or sample"),
+        _ => return Err("expected build, test, run, sample, check, format, lint, or architecture"),
     };
     let mut config = None;
     let mut filter = None;
@@ -99,10 +125,15 @@ fn root() -> PathBuf {
         .canonicalize()
         .expect("checkout exists")
 }
-fn cargo(root: &Path, config: Configuration, sub: &str) -> Command {
+// Cargo without build flags; rustup must never install a missing toolchain or component.
+fn cargo_plain(root: &Path) -> Command {
     let mut cmd = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
-    cmd.current_dir(root)
-        .arg(sub)
+    cmd.current_dir(root).env("RUSTUP_AUTO_INSTALL", "0");
+    cmd
+}
+fn cargo(root: &Path, config: Configuration, sub: &str) -> Command {
+    let mut cmd = cargo_plain(root);
+    cmd.arg(sub)
         .args(["--locked", "--offline", "--no-default-features"])
         .env(
             "CARGO_TARGET_DIR",
@@ -367,7 +398,11 @@ fn checked(cmd: &mut Command, cancel: &AtomicBool) -> Result<Output, String> {
     }
     Ok(output)
 }
-fn metadata(root: &Path, config: Configuration, cancel: &AtomicBool) -> Result<Value, String> {
+fn metadata_bytes(
+    root: &Path,
+    config: Configuration,
+    cancel: &AtomicBool,
+) -> Result<Vec<u8>, String> {
     let mut cmd = cargo(root, config, "metadata");
     cmd.args(["--format-version", "1", "--no-deps"]);
     let output = checked(&mut cmd, cancel)?;
@@ -382,7 +417,11 @@ fn metadata(root: &Path, config: Configuration, cancel: &AtomicBool) -> Result<V
     if data.len() as u64 > JSON_LIMIT {
         return Err("Cargo metadata exceeds JSON limit".into());
     }
-    serde_json::from_slice(&data).map_err(|e| format!("invalid Cargo metadata: {e}"))
+    Ok(data)
+}
+fn metadata(root: &Path, config: Configuration, cancel: &AtomicBool) -> Result<Value, String> {
+    serde_json::from_slice(&metadata_bytes(root, config, cancel)?)
+        .map_err(|e| format!("invalid Cargo metadata: {e}"))
 }
 fn package<'a>(metadata: &'a Value, name: &str) -> Result<&'a Value, String> {
     let packages = metadata["packages"]
@@ -615,6 +654,11 @@ fn test(
     }
     Ok(())
 }
+fn verb(root: &Path, which: checks::Slice, cancel: &AtomicBool) -> Result<(), String> {
+    checks::run_ops(&checks::slice(which), cancel, |op| {
+        checks::execute(root, op, cancel)
+    })
+}
 fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let task = match parse(&args) {
@@ -633,6 +677,15 @@ fn main() {
     }
     let root = root();
     let result = match task {
+        Task::Check => checks::run_ops(&checks::all(), &cancel, |op| {
+            checks::execute(&root, op, &cancel)
+        }),
+        Task::Lint => verb(&root, checks::Slice::Lint, &cancel),
+        Task::Architecture => verb(&root, checks::Slice::Architecture, &cancel),
+        Task::Format { write: false } => verb(&root, checks::Slice::Format, &cancel),
+        Task::Format { write: true } => checks::run_ops(&checks::format_write(), &cancel, |op| {
+            checks::execute(&root, op, &cancel)
+        }),
         Task::Build(c) => build(&root, c, &cancel).map(|_| ()),
         Task::Test(t, c, f) => test(&root, t, c, f, &cancel),
         Task::Run(args) => build(&root, Configuration::Development, &cancel).and_then(|a| {
@@ -656,6 +709,17 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::AtomicBool;
     use winter_test_harness::{Completion, RuntimeFixture, Termination, TestSignal, invoke};
+
+    // A scratch directory under the lease's private temporary root when there is one.
+    pub fn scratch() -> tempfile::TempDir {
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("winter-dev-test-");
+        match std::env::var_os("BLIZZARD_TMPDIR") {
+            Some(p) => builder.tempdir_in(p),
+            None => builder.tempdir(),
+        }
+        .unwrap()
+    }
 
     fn executable(path: &Path, contents: &str) {
         fs::write(path, contents).unwrap();
