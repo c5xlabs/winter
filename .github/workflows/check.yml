@@ -1,0 +1,51 @@
+name: check
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The cache only saves setup time. Bootstrap still verifies every pinned tool version.
+      # A cold bootstrap can outlast the job limit on slower hosts, so the tools are saved under
+      # a per-run key even when bootstrap is cut short, and the next run resumes from them.
+      - id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .tools
+            ~/.cache/dprint
+            ~/Library/Caches/Dprint
+          key: tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dev-tools.env', 'dprint.json', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dev-tools.env', 'dprint.json', 'rust-toolchain.toml') }}-
+      # Cold bootstrap compiles dprint and rumdl from source. Cutting link-time optimization and
+      # using more codegen units keeps that inside the time limit on the slowest host; the
+      # installed versions are unchanged and bootstrap still verifies them.
+      - run: ./scripts/bootstrap-dev.sh
+        timeout-minutes: 24
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "off"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+          CARGO_PROFILE_RELEASE_DEBUG: "false"
+      - if: always() && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .tools
+            ~/.cache/dprint
+            ~/Library/Caches/Dprint
+          key: tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dev-tools.env', 'dprint.json', 'rust-toolchain.toml') }}-${{ github.run_id }}
+      - run: cargo dev check

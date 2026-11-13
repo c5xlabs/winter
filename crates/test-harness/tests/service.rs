@@ -421,7 +421,12 @@ mod sample {
         let input = inputs();
         let fixture = RuntimeFixture::new().unwrap();
         let mut name = b"sample ".to_vec();
-        name.push(0xff);
+        // macOS filesystems reject names that are not valid UTF-8; use a non-ASCII name there.
+        if cfg!(target_os = "macos") {
+            name.extend_from_slice("ü".as_bytes());
+        } else {
+            name.push(0xff);
+        }
         let copy = fixture.path().join("bin").join(OsString::from_vec(name));
         fs::copy(&input.sample, &copy).unwrap();
         fs::set_permissions(&copy, fs::Permissions::from_mode(0o700)).unwrap();

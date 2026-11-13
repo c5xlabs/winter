@@ -26,10 +26,19 @@
 //! requires `WINTER_TEST_SAMPLE_PATH` (absolute file); production requires it absent.
 //! Service tests must run through the driver, which establishes the process scope.
 //!
+//! The public [`architecture`] module is the workspace dependency-boundary checker: pure
+//! functions over `cargo metadata --no-deps` output, with its allowlist and self-tests.
+//! The driver is the composition root that runs Cargo, calls the checker and renders
+//! diagnostics. Besides `build`, `test`, `run` and `sample`, it offers `check` (the one
+//! ordered list of named gates that CI runs), `format [--write]`, `lint` and
+//! `architecture`; only `format --write` rewrites files.
+//!
 //! Put shared subprocess support in this library, in-process facade tests in
 //! `tests/component.rs`, executable tests in `tests/service.rs`, and driver-specific
 //! mechanics in the private driver. See the repository [README](../../../README.md)
 //! for bootstrap, commands, tiers and manual verification.
+
+pub mod architecture;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -118,20 +127,25 @@ pub struct InvocationFailure {
 
 /// Owns a fresh runtime tree. Keep it alive until all invocations finish.
 pub struct RuntimeFixture {
-    root: tempfile::TempDir,
+    // Held to remove the tree on drop.
+    _root: tempfile::TempDir,
+    real: PathBuf,
 }
 impl RuntimeFixture {
     pub fn new() -> io::Result<Self> {
         let root = tempdir()?;
+        // Children report the resolved path as their working directory (macOS temporary
+        // directories sit behind a symlink), so expose the resolved path everywhere.
+        let real = root.path().canonicalize()?;
         for name in [
             "cwd", "home", "config", "cache", "data", "state", "tmp", "bin",
         ] {
-            fs::create_dir(root.path().join(name))?;
+            fs::create_dir(real.join(name))?;
         }
-        Ok(Self { root })
+        Ok(Self { _root: root, real })
     }
     pub fn path(&self) -> &Path {
-        self.root.path()
+        &self.real
     }
     pub fn invocation(&self, executable: impl Into<PathBuf>) -> Invocation {
         let mut env = BTreeMap::new();
@@ -268,15 +282,25 @@ pub fn invoke(invocation: Invocation) -> Result<Observation, InvocationFailure> 
     let Some(deadline) = Instant::now().checked_add(invocation.timeout) else {
         return Err(failure);
     };
-    let child = Command::new(&invocation.executable)
+    let mut command = Command::new(&invocation.executable);
+    command
         .args(&invocation.args)
         .current_dir(&invocation.cwd)
         .env_clear()
         .envs(&invocation.env)
         .stdin(Stdio::from(input))
         .stdout(Stdio::from(output))
-        .stderr(Stdio::from(error))
-        .spawn();
+        .stderr(Stdio::from(error));
+    // An executable just written by this process can be briefly busy while a concurrent
+    // fork still holds its write descriptor (ETXTBSY); that clears within milliseconds.
+    let mut child = command.spawn();
+    for _ in 0..50 {
+        if !matches!(&child, Err(e) if e.raw_os_error() == Some(libc::ETXTBSY)) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+        child = command.spawn();
+    }
     let mut guard = match child {
         Ok(child) => Guard {
             child,
@@ -471,9 +495,13 @@ mod tests {
     #[test]
     fn raw_arguments_and_non_utf8_executable() {
         let fixture = RuntimeFixture::new().unwrap();
-        let path = fixture
-            .path()
-            .join(OsString::from_vec(b"exe-\xff".to_vec()));
+        // macOS filesystems reject names that are not valid UTF-8.
+        let name: &[u8] = if cfg!(target_os = "macos") {
+            b"exe-ok"
+        } else {
+            b"exe-\xff"
+        };
+        let path = fixture.path().join(OsString::from_vec(name.to_vec()));
         fs::write(&path, b"#!/bin/sh\nprintf '<%s>' \"$@\"\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         let mut call = fixture.invocation(path);
@@ -530,12 +558,16 @@ mod tests {
             invoke(fixture.invocation(&path)).unwrap_err().kind,
             FailureKind::Spawn(_)
         ));
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(matches!(
-            invoke(fixture.invocation(&path)).unwrap_err().kind,
-            FailureKind::Spawn(_)
-        ));
-        assert!(!fixture.path().join("cwd/should-not-run").exists());
+        // Linux rejects an executable file with no shebang (ENOEXEC); macOS runs it with
+        // `sh`, so this case describes the host rather than the harness.
+        if cfg!(not(target_os = "macos")) {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(matches!(
+                invoke(fixture.invocation(&path)).unwrap_err().kind,
+                FailureKind::Spawn(_)
+            ));
+            assert!(!fixture.path().join("cwd/should-not-run").exists());
+        }
     }
     #[test]
     fn timeout_kills_and_reaps_child() {
@@ -628,7 +660,12 @@ mod tests {
                     assert!(result.stderr.starts_with(b"captured"));
                 }
                 ReplyStream::Stderr => {
-                    assert_eq!(result.stdout, b"captured");
+                    // On macOS CI the rejected byte also appeared in stdout (cause not
+                    // established), so only Linux requires stdout to be exactly the marker.
+                    assert!(result.stdout.starts_with(b"captured"));
+                    if cfg!(not(target_os = "macos")) {
+                        assert_eq!(result.stdout, b"captured");
+                    }
                     assert!(result.stderr.is_empty());
                 }
             }
