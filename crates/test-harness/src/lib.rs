@@ -282,15 +282,25 @@ pub fn invoke(invocation: Invocation) -> Result<Observation, InvocationFailure> 
     let Some(deadline) = Instant::now().checked_add(invocation.timeout) else {
         return Err(failure);
     };
-    let child = Command::new(&invocation.executable)
+    let mut command = Command::new(&invocation.executable);
+    command
         .args(&invocation.args)
         .current_dir(&invocation.cwd)
         .env_clear()
         .envs(&invocation.env)
         .stdin(Stdio::from(input))
         .stdout(Stdio::from(output))
-        .stderr(Stdio::from(error))
-        .spawn();
+        .stderr(Stdio::from(error));
+    // An executable just written by this process can be briefly busy while a concurrent
+    // fork still holds its write descriptor (ETXTBSY); that clears within milliseconds.
+    let mut child = command.spawn();
+    for _ in 0..50 {
+        if !matches!(&child, Err(e) if e.raw_os_error() == Some(libc::ETXTBSY)) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+        child = command.spawn();
+    }
     let mut guard = match child {
         Ok(child) => Guard {
             child,
